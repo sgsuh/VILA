@@ -282,7 +282,8 @@ def build_conversation(messages: List[ChatMessage], tools_prompt: Optional[str])
 
 
 def completion_message(text: str, tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
-    message = {"role": "assistant", "content": [{"type": "text", "text": text}] if text else None}
+    # OpenAI format: content is a string, or null when the reply only calls tools.
+    message = {"role": "assistant", "content": text or None}
     if tool_calls:
         message["tool_calls"] = tool_calls
     return message
