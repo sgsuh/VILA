@@ -182,6 +182,7 @@ def usage_fields(stats: Dict[str, Any]) -> Dict[str, Any]:
             "prompt_tokens": stats["prompt_tokens"],
             "completion_tokens": stats["completion_tokens"],
             "total_tokens": stats["prompt_tokens"] + stats["completion_tokens"],
+            "prompt_tokens_details": {"cached_tokens": stats.get("cached_tokens", 0)},
         },
         "timing": {key: stats[key] for key in ("ttft_s", "decode_tokens_per_s", "total_s")},
     }
@@ -303,6 +304,8 @@ async def lifespan(app: FastAPI):
     else:
         tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, model_name, None)
         print(f"Model {model_name} loaded successfully. Context length: {context_len}")
+    if app.args.prefix_cache:
+        model.enable_prefix_caching()
     yield
 
 
@@ -450,6 +453,7 @@ if __name__ == "__main__":
     workers = os.getenv("VILA_WORKERS", 1)
     backend = os.getenv("VILA_BACKEND", "hf")
     quant_dir = os.getenv("VILA_QUANT_DIR") or None
+    prefix_cache = os.getenv("VILA_PREFIX_CACHE", "0").lower() in ("1", "true", "yes")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default=host)
@@ -458,6 +462,12 @@ if __name__ == "__main__":
     parser.add_argument("--conv-mode", type=str, default=conv_mode)
     parser.add_argument("--workers", type=int, default=workers)
     parser.add_argument("--backend", choices=["hf", "tinychat"], default=backend)
+    parser.add_argument(
+        "--prefix-cache",
+        action=argparse.BooleanOptionalAction,
+        default=prefix_cache,
+        help="Reuse the KV cache of the prompt prefix shared with the previous request",
+    )
     parser.add_argument(
         "--quant-dir", type=str, default=quant_dir, help="AWQ checkpoint dir for --backend tinychat (default: runs/awq/<model>)"
     )

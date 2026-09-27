@@ -1,6 +1,9 @@
 from typing import List, Optional, Tuple
 
-__all__ = ["truncate_at_stop", "StopStringFilter"]
+import torch
+from transformers import PreTrainedTokenizer, StoppingCriteria
+
+__all__ = ["truncate_at_stop", "StopStringFilter", "StopStringsCriteria"]
 
 
 def truncate_at_stop(text: str, stop: Optional[List[str]]) -> Tuple[str, bool]:
@@ -46,3 +49,22 @@ class StopStringFilter:
             if any(s.startswith(suffix) for s in self.stop):
                 return length
         return 0
+
+
+class StopStringsCriteria(StoppingCriteria):
+    """Stop once the generated text contains a stop string.
+
+    Only tokens generated after the first call are checked, so the prompt (which may be filled
+    with placeholder ids when generating from a KV cache) never triggers a stop.
+    """
+
+    def __init__(self, tokenizer: PreTrainedTokenizer, stop: List[str]) -> None:
+        self.tokenizer = tokenizer
+        self.stop = stop
+        self.prompt_length = None
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> torch.BoolTensor:
+        if self.prompt_length is None:
+            self.prompt_length = input_ids.shape[1] - 1
+        texts = self.tokenizer.batch_decode(input_ids[:, self.prompt_length :], skip_special_tokens=True)
+        return torch.tensor([truncate_at_stop(text, self.stop)[1] for text in texts], device=input_ids.device)

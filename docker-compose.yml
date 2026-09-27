@@ -24,6 +24,7 @@ x-vila-common: &vila-common
     VILA_CONV_MODE: ${VILA_CONV_MODE:-auto}
     VILA_BACKEND: ${VILA_BACKEND:-hf}
     VILA_QUANT_DIR: ${VILA_QUANT_DIR:-}
+    VILA_PREFIX_CACHE: ${VILA_PREFIX_CACHE:-0}
     HF_TOKEN: ${HF_TOKEN:-}
 
 services:

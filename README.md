@@ -316,6 +316,7 @@ The server also supports:
 - `tools` / `tool_choice`: function calling. Tool calls are returned in `message.tool_calls` and tool results are sent back as `role: "tool"` messages. When streaming with tools, the parsed result arrives as a single chunk.
 - Metrics: responses (and the last streamed chunk) include `usage` token counts and a `timing` section with `ttft_s`, `decode_tokens_per_s` and `total_s`. `vila-infer --stats` prints the same metrics.
 - `--backend tinychat`: serve AWQ-quantized models, see [scripts/awq](scripts/awq/README.md).
+- `--prefix-cache` (or `VILA_PREFIX_CACHE=1`): reuse the KV cache of the prompt prefix shared with the previous request and cache recent media embeddings, so follow-up chat turns skip re-encoding earlier images and re-prefilling the history. Reused tokens are reported in `usage.prompt_tokens_details.cached_tokens`. The cache holds one conversation at a time; interleaved conversations still benefit from the media cache.
 
 <sup>NOTE: This API server is intended for evaluation purposes only and has not been optimized for production use. SGLang support is coming on the way.</sup>
 

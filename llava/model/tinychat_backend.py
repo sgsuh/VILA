@@ -16,6 +16,7 @@ from transformers import AutoConfig, GenerationConfig
 
 from llava.utils.generation_stats import summarize_generation
 from llava.utils.logging import logger
+from llava.utils.prefix_cache import CachedMediaEncoder, reusable_prefix_length
 from llava.utils.stop_strings import truncate_at_stop
 from llava.utils.tokenizer import as_conversation
 
@@ -24,24 +25,6 @@ SMOOTH_SCALE_FILENAME = "smooth-scale.pt"
 # SmoothQuant migration strength used by tinychat/nvila_demo.py.
 SMOOTH_ALPHA = 0.3
 ROLES = {"system": "system", "human": "user", "gpt": "assistant"}
-
-
-class _StepRecorder:
-    """Proxy for the TinyChat model that records the input length and end time of each forward step."""
-
-    def __init__(self, model) -> None:
-        self._model = model
-        self.step_lengths = []
-        self.step_times = []
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._model, name)
-
-    def stream_gen(self, *args, **kwargs):
-        out, length = self._model.stream_gen(*args, **kwargs)
-        self.step_lengths.append(length)
-        self.step_times.append(time.perf_counter())
-        return out, length
 
 
 def resolve_model_path(model_path: str) -> str:
@@ -62,9 +45,14 @@ class TinyChatNVILA:
         model_path: str,
         quant_dir: Optional[str] = None,
         device: str = "cuda:0",
-        max_seq_len: int = 2048,
+        max_seq_len: int = 8192,
+        prefix_caching: bool = False,
     ) -> None:
         import tinychat.utils.constants
+
+        # Sizes the preallocated KV cache; must be set before the TinyChat model modules are imported.
+        tinychat.utils.constants.max_seq_len = max_seq_len
+
         from awq.quantize import smooth_lm
         from tinychat.models.nvila_qwen2 import NVILAQwen2
         from tinychat.models.qwen2 import Qwen2ForCausalLM
@@ -79,7 +67,6 @@ class TinyChatNVILA:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"{path} not found; run scripts/awq/quantize_nvila.sh first")
 
-        tinychat.utils.constants.max_seq_len = max_seq_len
         model_path = resolve_model_path(model_path)
         config = AutoConfig.from_pretrained(model_path)
         config.resume_path = model_path
@@ -100,9 +87,24 @@ class TinyChatNVILA:
 
         self.model = model.cuda().eval()
         self.device = device
+        self.kv_max_seq_len = next(m.kv_max_seq_len for m in self.model.llm.modules() if hasattr(m, "kv_max_seq_len"))
+        self.prefix_caching = False
+        # Embeddings of the positions currently held in the LLM's KV cache (see generate_content).
+        self._prefix_embeds = None
+        if prefix_caching:
+            self.enable_prefix_caching()
         device_warmup(device)
         tune_llava_patch_embedding(self.model.vision_tower, device=device)
         logger.info(f"Loaded TinyChat NVILA from {model_path} with AWQ weights from {quant_dir}")
+
+    def enable_prefix_caching(self) -> None:
+        """Reuse work across calls that share a prompt prefix, e.g. successive chat turns:
+        the KV cache of the shared prefix and the embeddings of recently seen media."""
+        self.prefix_caching = True
+        self.model.encoders = {
+            name: encoder if isinstance(encoder, CachedMediaEncoder) else CachedMediaEncoder(encoder)
+            for name, encoder in self.model.encoders.items()
+        }
 
     @property
     def tokenizer(self):
@@ -114,23 +116,25 @@ class TinyChatNVILA:
 
     @property
     def default_generation_config(self) -> GenerationConfig:
-        # Mirrors tinychat.utils.conversation_utils.gen_params.
-        return GenerationConfig(
-            max_new_tokens=512, do_sample=True, temperature=0.2, top_p=0.95, top_k=50, repetition_penalty=1.1
-        )
+        # Mirrors tinychat.utils.conversation_utils.gen_params (its repetition penalty is unused for NVILA).
+        return GenerationConfig(max_new_tokens=512, do_sample=True, temperature=0.2, top_p=0.95, top_k=50)
 
-    @staticmethod
-    def _to_gen_params(generation_config: GenerationConfig):
-        from tinychat.utils.conversation_utils import gen_params
+    def _embed_prompt(self, text_prompt: str, media: Dict[str, List[torch.Tensor]], media_config) -> torch.Tensor:
+        """Prompt embeddings [seq, hidden], built the same way as TinyChat's NVILA `stream_gen`."""
+        input_ids = torch.as_tensor([self.tokenizer(text_prompt)["input_ids"]], device=self.device)
+        if not media:
+            return self.model.llm.model.embed_tokens(input_ids)[0]
 
-        # AttributeDict does not support deepcopy; its values are all scalars or an empty dict.
-        params = type(gen_params)(list(gen_params.items()))
-        params.n_predict = generation_config.max_new_tokens or params.n_predict
-        params.temp = generation_config.temperature if generation_config.do_sample else 0.0
-        params.top_p = generation_config.top_p
-        params.top_k = generation_config.top_k
-        params.repeat_penalty = generation_config.repetition_penalty
-        return params
+        image_token_id = self.tokenizer.media_token_ids["image"]
+        image_positions = (input_ids[0] == image_token_id).nonzero()
+        if len(image_positions) == 1 and self.config.image_aspect_ratio == "dynamic":
+            # A single dynamic-resolution image is split into tiles, each with its own media token.
+            position = image_positions[0].item()
+            newline = self.tokenizer.encode("\n", add_special_tokens=False)
+            tiles = torch.as_tensor([(newline + [image_token_id] + newline) * len(media["image"])], device=self.device)
+            input_ids = torch.cat([input_ids[:, :position], tiles, input_ids[:, position + 1 :]], dim=1)
+        inputs_embeds, _, _ = self.model._embed(input_ids, media, media_config, None, attention_mask=None)
+        return inputs_embeds[0]
 
     @torch.inference_mode()
     def generate_content(
@@ -145,13 +149,14 @@ class TinyChatNVILA:
         """Generate a response; if given, `streamer` (a TextIteratorStreamer) receives text deltas.
 
         `prompt` is a single-turn prompt or a conversation (see `llava.utils.tokenizer.as_conversation`).
-        If given, `stats` is filled with token counts and latency metrics.
+        If given, `stats` is filled with token counts and latency metrics. With `prefix_caching`, the KV
+        cache of the longest prefix shared with the previous call is reused, so only the rest is prefilled.
         """
         start = time.perf_counter()
         if response_format is not None:
             raise NotImplementedError("response_format is not supported by the TinyChat backend")
 
-        from tinychat.stream_generators.NVILA_stream_gen import NVILAStreamGenerator
+        from tinychat.stream_generators.llava_stream_gen import prepare_logits_processor
         from tinychat.utils.prompt_templates import get_stop_token_ids
 
         # prepare_media replaces media parts with media tokens in the conversation text.
@@ -162,47 +167,76 @@ class TinyChatNVILA:
             add_generation_prompt=True,
             tokenize=False,
         )
+        embeds = self._embed_prompt(text_prompt, media, media_config)
+        prompt_length = embeds.shape[0]
 
-        # Each step generates one token; the first step's input is the whole prompt (media embeddings included).
-        recorder = _StepRecorder(self.model)
-        outputs = NVILAStreamGenerator(
-            recorder,
-            self._to_gen_params(generation_config or self.default_generation_config),
-            text_prompt,
-            media or None,
-            media_config if media else None,
-            start_pos=0,
-            device=self.device,
-            stop_token_ids=get_stop_token_ids("nvila"),
-            quant_llm=True,
+        generation_config = generation_config or self.default_generation_config
+        max_new_tokens = min(generation_config.max_new_tokens or 512, self.kv_max_seq_len - prompt_length)
+        if max_new_tokens <= 0:
+            raise ValueError(f"The prompt ({prompt_length} tokens) does not fit in the KV cache ({self.kv_max_seq_len})")
+        temperature = generation_config.temperature if generation_config.do_sample else 0.0
+        greedy = temperature < 1e-5 or generation_config.top_p < 1e-8
+        logits_processor = prepare_logits_processor(
+            temperature, 1.0, generation_config.top_p, generation_config.top_k or 0
         )
+        stop_token_ids = set(get_stop_token_ids("nvila") + [self.tokenizer.eos_token_id])
 
+        reused = 0
+        if self.prefix_caching and self._prefix_embeds is not None:
+            reused = reusable_prefix_length(self._prefix_embeds, embeds)
+        # Positions from `reused` on are about to be overwritten.
+        self._prefix_embeds = None
+        chunk_prefilling = reused > 0
+
+        sampled_ids, token_times = [], []
         text = streamed = ""
         try:
-            for output in outputs:
-                text, stopped = truncate_at_stop(output["text"], stop)
+            # Prefill the uncached part of the prompt (attending to the cached prefix), then decode.
+            logits = self.model.llm(None, reused, embeds[None, reused:], chunk_prefilling)
+            for step in range(max_new_tokens):
+                if step > 0:
+                    token_embeds = self.model.llm.model.embed_tokens(
+                        torch.as_tensor([[sampled_ids[-1]]], device=self.device)
+                    )
+                    logits = self.model.llm(None, prompt_length + step - 1, token_embeds, chunk_prefilling)
+                scores = logits_processor(None, logits[:, -1, :])[0]
+                if greedy:
+                    token = int(torch.argmax(scores))
+                else:
+                    probs = torch.softmax(scores.float(), dim=-1)
+                    if not torch.isfinite(probs).all():
+                        raise RuntimeError("TinyChat generation produced invalid probabilities")
+                    token = int(torch.multinomial(probs, num_samples=1))
+                sampled_ids.append(token)
+                token_times.append(time.perf_counter())
+                if token in stop_token_ids:
+                    break
+
+                text, stopped = truncate_at_stop(self.tokenizer.decode(sampled_ids, skip_special_tokens=True), stop)
                 # Hold back incomplete multi-byte characters until they decode fully.
                 if streamer is not None and text.startswith(streamed) and not text.endswith("\ufffd"):
                     streamer.on_finalized_text(text[len(streamed) :])
                     streamed = text
                 if stopped:
-                    outputs.close()
                     break
-        except SystemExit as e:
-            # NVILAStreamGenerator calls exit() when sampling hits Inf/NaN probabilities.
-            raise RuntimeError("TinyChat generation produced invalid probabilities") from e
         finally:
             if streamer is not None:
                 streamer.on_finalized_text(text[len(streamed) :] if text.startswith(streamed) else "", stream_end=True)
-        if stats is not None and recorder.step_lengths:
+
+        if self.prefix_caching:
+            # The KV cache holds the prompt and every sampled token except the last one (never fed back).
+            fed_ids = torch.as_tensor(sampled_ids[:-1], dtype=torch.long, device=self.device)
+            self._prefix_embeds = torch.cat([embeds, self.model.llm.model.embed_tokens(fed_ids)])
+        if stats is not None:
             stats.update(
                 summarize_generation(
-                    recorder.step_lengths[0],
-                    len(recorder.step_lengths),
+                    prompt_length,
+                    len(sampled_ids),
                     start,
-                    recorder.step_times[0],
-                    recorder.step_times[-1],
+                    token_times[0] if token_times else None,
+                    token_times[-1] if token_times else None,
                     time.perf_counter(),
-                )
+                ),
+                cached_tokens=reused,
             )
         return text.strip()

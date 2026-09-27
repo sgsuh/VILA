@@ -30,14 +30,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 from hydra.utils import instantiate
-from transformers import (
-    AutoConfig,
-    GenerationConfig,
-    LogitsProcessor,
-    PreTrainedModel,
-    StoppingCriteriaList,
-    StopStringCriteria,
-)
+from transformers import AutoConfig, DynamicCache, GenerationConfig, LogitsProcessor, PreTrainedModel, StoppingCriteriaList
 from transformers.modeling_utils import ContextManagers, no_init_weights
 from llava.constants import MEDIA_TOKENS
 
@@ -53,7 +46,8 @@ from llava.train.sequence_parallel import get_pg_manager
 from llava.utils import distributed
 from llava.utils.media import extract_media
 from llava.utils.generation_stats import GenerationTimer
-from llava.utils.stop_strings import truncate_at_stop
+from llava.utils.prefix_cache import CachedMediaEncoder, reusable_prefix_length
+from llava.utils.stop_strings import StopStringsCriteria, truncate_at_stop
 from llava.utils.tokenizer import as_conversation, tokenize_conversation
 
 
@@ -842,7 +836,80 @@ class LlavaMetaForCausalLM(ABC):
         inputs_embeds, _, attention_mask = self._embed(input_ids, media, media_config, None, attention_mask)
         if stats is not None:
             stats["prompt_tokens"] = inputs_embeds.shape[1]
+            stats["cached_tokens"] = 0
+        # Structured generation (logits_processor) tracks its own state from input_ids, so it skips the cache.
+        if getattr(self, "prefix_caching", False) and inputs_embeds.shape[0] == 1 and not generation_kwargs.get(
+            "logits_processor"
+        ):
+            return self._generate_with_prefix_cache(input_ids, inputs_embeds, stats, **generation_kwargs)
         return self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
+
+    def enable_prefix_caching(self) -> None:
+        """Reuse work across generate calls that share a prompt prefix, e.g. successive chat turns:
+        the KV cache of the shared prefix and the embeddings of recently seen media."""
+        self.prefix_caching = True
+        self.encoders = {
+            name: encoder if isinstance(encoder, CachedMediaEncoder) else CachedMediaEncoder(encoder)
+            for name, encoder in self.encoders.items()
+        }
+
+    def _generate_with_prefix_cache(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        stats: Optional[Dict[str, Any]],
+        **generation_kwargs,
+    ) -> torch.Tensor:
+        """Generate while reusing the KV cache of the longest prefix shared with the previous call.
+
+        transformers only consumes `inputs_embeds` when nothing is cached, so `generate` is fed the
+        trailing prompt token ids; any uncached part before them (e.g. new media) is prefilled here.
+        Returns only the generated token ids, like generating from `inputs_embeds`.
+        """
+        embeds = inputs_embeds[0]
+        prompt_length = embeds.shape[0]
+        cache, self._prefix_cache = getattr(self, "_prefix_cache", None), None  # invalid until this call succeeds
+
+        reused = 0
+        if cache is not None:
+            cached_embeds, kv_cache = cache
+            reused = reusable_prefix_length(cached_embeds, embeds)
+        if reused == 0:
+            kv_cache = DynamicCache()
+        else:
+            kv_cache.crop(reused)
+        if stats is not None:
+            stats["cached_tokens"] = reused
+
+        # `generate` embeds the ids it is given, which is only valid for text positions: those after the
+        # last media token map one-to-one to the trailing embeddings.
+        media_token_ids = torch.tensor(list(self.tokenizer.media_token_ids.values()), device=input_ids.device)
+        is_media = torch.isin(input_ids[0], media_token_ids)
+        trailing_text = len(is_media) - (int(is_media.nonzero().max()) + 1 if is_media.any() else 0)
+        num_fed_ids = prompt_length - reused if prompt_length - reused <= trailing_text else 1
+        if prompt_length - num_fed_ids > reused:
+            self.llm.get_decoder()(
+                inputs_embeds=inputs_embeds[:, reused : prompt_length - num_fed_ids],
+                past_key_values=kv_cache,
+                use_cache=True,
+                cache_position=torch.arange(reused, prompt_length - num_fed_ids, device=embeds.device),
+            )
+
+        # Only the trailing ids are fed to the model; the placeholders just give the sequence its cached length.
+        pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        placeholder_ids = torch.full((1, prompt_length), pad_token_id, dtype=torch.long, device=embeds.device)
+        placeholder_ids[0, -num_fed_ids:] = input_ids[0, -num_fed_ids:]
+        output_ids = self.llm.generate(
+            input_ids=placeholder_ids,
+            attention_mask=torch.ones_like(placeholder_ids),
+            past_key_values=kv_cache,
+            **generation_kwargs,
+        )[:, prompt_length:]
+
+        # The cache now holds the prompt and every generated token except the last one.
+        generated_embeds = self.llm.get_input_embeddings()(output_ids[0])
+        self._prefix_cache = (torch.cat([embeds, generated_embeds])[: kv_cache.get_seq_length()], kv_cache)
+        return output_ids
 
     @torch.inference_mode()
     def generate_content(
@@ -936,7 +1003,7 @@ class LlavaMetaForCausalLM(ABC):
 
         # Set up the generation config
         generation_config = generation_config or self.default_generation_config
-        stopping_criteria = StoppingCriteriaList([timer] + ([StopStringCriteria(self.tokenizer, stop)] if stop else []))
+        stopping_criteria = StoppingCriteriaList([timer] + ([StopStringsCriteria(self.tokenizer, stop)] if stop else []))
         generation_stats = {}
 
         # Generate the response
@@ -955,6 +1022,9 @@ class LlavaMetaForCausalLM(ABC):
             if not generation_config.do_sample:
                 raise
             timer.reset_tokens()
+            stopping_criteria = StoppingCriteriaList(
+                [timer] + ([StopStringsCriteria(self.tokenizer, stop)] if stop else [])
+            )
             # FIXME(zhijianl): This is a temporary workaround for the sampling issue
             logging.warning("Generation failed with sampling, retrying with greedy decoding.")
             generation_config.do_sample = False
@@ -973,7 +1043,10 @@ class LlavaMetaForCausalLM(ABC):
         response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         response = truncate_at_stop(response, stop)[0].strip()
         if stats is not None:
-            stats.update(timer.summary(generation_stats["prompt_tokens"]))
+            stats.update(
+                timer.summary(generation_stats["prompt_tokens"]),
+                cached_tokens=generation_stats.get("cached_tokens", 0),
+            )
         return response
 
     @property
@@ -1597,7 +1670,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
 
         # Set up the generation config
         generation_config = generation_config or self.default_generation_config
-        stopping_criteria = StoppingCriteriaList([timer] + ([StopStringCriteria(self.tokenizer, stop)] if stop else []))
+        stopping_criteria = StoppingCriteriaList([timer] + ([StopStringsCriteria(self.tokenizer, stop)] if stop else []))
         generation_stats = {}
 
         # Generate the response
@@ -1620,6 +1693,9 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
             if not generation_config.do_sample:
                 raise
             timer.reset_tokens()
+            stopping_criteria = StoppingCriteriaList(
+                [timer] + ([StopStringsCriteria(self.tokenizer, stop)] if stop else [])
+            )
             # FIXME(zhijianl): This is a temporary workaround for the sampling issue
             logging.warning("Generation failed with sampling, retrying with greedy decoding.")
             generation_config.do_sample = False
@@ -1647,7 +1723,10 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         response = truncate_at_stop(response, stop)[0].strip()
         if stats is not None:
-            stats.update(timer.summary(generation_stats["prompt_tokens"]))
+            stats.update(
+                timer.summary(generation_stats["prompt_tokens"]),
+                cached_tokens=generation_stats.get("cached_tokens", 0),
+            )
 
         if return_selection_probs:
             return response, top_down_selection_maps, top_down_selection_probs
