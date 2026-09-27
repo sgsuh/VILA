@@ -1,0 +1,39 @@
+# syntax=docker/dockerfile:1
+# Development image for VILA: reproduces the README installation steps
+# (environment_setup.sh) inside a container. The repository is bind-mounted
+# at runtime, so the editable install always reflects the local source tree.
+
+FROM nvidia/cuda:12.2.2-cudnn8-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_ROOT_USER_ACTION=ignore
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates build-essential \
+        ffmpeg libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Miniforge (conda-forge channel) avoids the Anaconda channel ToS prompt.
+RUN curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -o /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p /opt/conda \
+    && rm /tmp/miniforge.sh \
+    && /opt/conda/bin/conda create -n vila python=3.10.14 -y \
+    && /opt/conda/bin/conda clean -afy
+
+# Putting the env first on PATH is equivalent to `conda activate vila`.
+ENV CONDA_DEFAULT_ENV=vila \
+    PATH=/opt/conda/envs/vila/bin:/opt/conda/bin:$PATH
+
+WORKDIR /workspace/VILA
+
+# Only copy what the installer needs; the full repo is mounted at runtime.
+COPY pyproject.toml README.md environment_setup.sh ./
+COPY llava llava
+
+# Run the README installer without an env name: it skips conda env creation
+# (already done above) and uses the CUDA toolkit shipped in the base image.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    bash environment_setup.sh
+
+CMD ["bash"]

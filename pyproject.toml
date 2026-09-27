@@ -19,7 +19,7 @@ dependencies = [
     "pydantic<2,>=1", "markdown2[all]", "numpy==1.26.4", "scikit-learn==1.2.2",
     "gradio==3.35.2", "gradio_client==0.2.9",
     "requests", "httpx", "uvicorn", "fastapi", "fire", "seaborn", "ring_flash_attn==0.1.1",
-    "einops==0.6.1", "einops-exts==0.0.4", "timm==0.9.12",
+    "einops==0.6.1", "einops-exts==0.0.4", "timm==1.0.15",
     "openpyxl==3.1.2", "pytorchvideo==0.1.5", "decord2==2.0.0",
     "datasets==2.16.1", "openai==1.8.0", "webdataset==0.2.86",
     "nltk==3.3", "pywsd==1.2.4", "opencv-python-headless==4.8.0.76",

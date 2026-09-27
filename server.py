@@ -85,6 +85,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: Literal[
         "NVILA-15B",
+        "NVILA-Lite-2B",
         "VILA1.5-3B",
         "VILA1.5-3B-AWQ",
         "VILA1.5-3B-S2",
@@ -159,6 +160,7 @@ async def lifespan(app: FastAPI):
     disable_torch_init()
     model_path = app.args.model_path
     model_name = get_model_name_from_path(model_path)
+    conversation.default_conversation = conv_templates[app.args.conv_mode].copy()
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, model_name, None)
     print(f"Model {model_name} loaded successfully. Context length: {context_len}")
     yield
@@ -229,16 +231,12 @@ async def chat_completions(request: ChatCompletionRequest):
         if conv.sep_style == SeparatorStyle.LLAMA_3:
             conv.append_message(assistant_role, "")
 
-        prompt_text = conv.get_prompt()
-        logger.info(f"Prompt input: {prompt_text}")
-
-
-        input_ids = tokenizer_image_token(prompt_text, tokenizer, return_tensors="pt").unsqueeze(0).to(model.device)
-
+        # SeparatorStyle.AUTO has no manual prompt format; generate_content applies the tokenizer chat template.
+        if conv.sep_style != SeparatorStyle.AUTO:
+            prompt_text = conv.get_prompt()
+            logger.info(f"Prompt input: {prompt_text}")
 
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
-        keywords = [stop_str]
-        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
 
         if image is not None:
             prompt = [image, normalized_prompt]
