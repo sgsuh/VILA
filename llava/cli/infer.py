@@ -108,7 +108,13 @@ def main() -> None:
     parser.add_argument("--video_max_tiles", "-vm", type=int, default=-1)
     parser.add_argument("--json-mode", action="store_true")
     parser.add_argument("--json-schema", type=str, default=None)
+    parser.add_argument("--backend", choices=["hf", "tinychat"], default="hf")
+    parser.add_argument(
+        "--quant-dir", type=str, default=None, help="AWQ checkpoint dir for --backend tinychat (default: runs/awq/<model>)"
+    )
     args = parser.parse_args()
+    if args.backend == "tinychat" and (args.lora_path is not None or args.json_mode):
+        parser.error("--backend tinychat does not support --lora-path or --json-mode")
 
     # Convert json mode to response format
     if not args.json_mode:
@@ -121,7 +127,11 @@ def main() -> None:
         response_format = ResponseFormat(type="json_schema", json_schema=JsonSchemaResponseFormat(schema=schema_str))
 
     # Load model
-    if args.lora_path is None:
+    if args.backend == "tinychat":
+        from llava.model.tinychat_backend import TinyChatNVILA
+
+        model = TinyChatNVILA(args.model_path, args.quant_dir)
+    elif args.lora_path is None:
         model = llava.load(args.model_path, model_base=None)
     else:
         model = llava.load(args.lora_path, model_base=args.model_path)
@@ -132,10 +142,12 @@ def main() -> None:
 
     if args.video_max_tiles > 0:
         model.config.video_max_tiles = args.video_max_tiles
-        model.llm.config.video_max_tiles = args.video_max_tiles
+        if args.backend == "hf":
+            model.llm.config.video_max_tiles = args.video_max_tiles
 
     # Configure PS3 and adjust context length
-    configure_ps3_and_context_length(model)
+    if args.backend == "hf":
+        configure_ps3_and_context_length(model)
 
     # Set conversation mode
     clib.default_conversation = clib.conv_templates[args.conv_mode].copy()

@@ -25,3 +25,16 @@ docker compose run --rm vila scripts/awq/tinychat_demo.sh \
 
 Calibration media defaults to a demo video; pass your own images/videos as extra arguments
 to `quantize_nvila.sh`. The AWQ search uses the `mit-han-lab/pile-val-backup` dataset.
+
+## Using the quantized model from `vila-infer` and the API server
+
+Pass `--backend tinychat`; `--quant-dir` defaults to `runs/awq/<model name>`.
+LoRA and `--json-mode` are not supported by this backend.
+
+```bash
+docker compose run --rm vila vila-infer --backend tinychat \
+    --model-path Efficient-Large-Model/NVILA-Lite-2B \
+    --text "Please describe the image" --media demo_images/demo_img.png
+
+VILA_BACKEND=tinychat docker compose up vila-server   # or: server.py --backend tinychat
+```

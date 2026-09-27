@@ -174,8 +174,15 @@ async def lifespan(app: FastAPI):
     model_path = app.args.model_path
     model_name = get_model_name_from_path(model_path)
     conversation.default_conversation = conv_templates[app.args.conv_mode].copy()
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, model_name, None)
-    print(f"Model {model_name} loaded successfully. Context length: {context_len}")
+    if app.args.backend == "tinychat":
+        from llava.model.tinychat_backend import TinyChatNVILA
+
+        model = TinyChatNVILA(model_path, app.args.quant_dir)
+        tokenizer = model.tokenizer
+        print(f"Model {model_name} loaded successfully with the TinyChat backend.")
+    else:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, model_name, None)
+        print(f"Model {model_name} loaded successfully. Context length: {context_len}")
     yield
 
 
@@ -331,6 +338,8 @@ if __name__ == "__main__":
     model_path = os.getenv("VILA_MODEL_PATH", "Efficient-Large-Model/VILA1.5-3B")
     conv_mode = os.getenv("VILA_CONV_MODE", "vicuna_v1")
     workers = os.getenv("VILA_WORKERS", 1)
+    backend = os.getenv("VILA_BACKEND", "hf")
+    quant_dir = os.getenv("VILA_QUANT_DIR") or None
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", type=str, default=host)
@@ -338,6 +347,10 @@ if __name__ == "__main__":
     parser.add_argument("--model-path", type=str, default=model_path)
     parser.add_argument("--conv-mode", type=str, default=conv_mode)
     parser.add_argument("--workers", type=int, default=workers)
+    parser.add_argument("--backend", choices=["hf", "tinychat"], default=backend)
+    parser.add_argument(
+        "--quant-dir", type=str, default=quant_dir, help="AWQ checkpoint dir for --backend tinychat (default: runs/awq/<model>)"
+    )
     app.args = parser.parse_args()
 
     uvicorn.run(app, host=app.args.host, port=app.args.port, workers=app.args.workers)

@@ -22,6 +22,8 @@ x-vila-common: &vila-common
     HF_HOME: /cache/huggingface
     VILA_MODEL_PATH: ${VILA_MODEL_PATH:-Efficient-Large-Model/NVILA-Lite-2B}
     VILA_CONV_MODE: ${VILA_CONV_MODE:-auto}
+    VILA_BACKEND: ${VILA_BACKEND:-hf}
+    VILA_QUANT_DIR: ${VILA_QUANT_DIR:-}
     HF_TOKEN: ${HF_TOKEN:-}
 
 services:
