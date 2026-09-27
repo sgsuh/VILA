@@ -8,7 +8,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
-from threading import Thread
+from threading import Lock, Thread
 from typing import List, Literal, Optional, Union, get_args
 
 import requests
@@ -111,6 +111,19 @@ model_name = None
 tokenizer = None
 image_processor = None
 context_len = None
+
+# The model is shared across requests; concurrent generate calls corrupt its state (NaN logits).
+generation_lock = Lock()
+
+
+def generate_to_streamer(streamer: TextIteratorStreamer, **kwargs) -> None:
+    try:
+        with generation_lock:
+            model.generate_content(streamer=streamer, **kwargs)
+    except Exception:
+        logger.exception("Streaming generation failed")
+        # Unblock the consumer so the response terminates instead of hanging.
+        streamer.end()
 
 
 def load_image(image_url: str) -> Image:
@@ -247,7 +260,12 @@ async def chat_completions(request: ChatCompletionRequest):
 
         with torch.inference_mode():
             if request.stream:
-                streamer = model.generate_content(prompt, stream=True, generation_config = generation_config)
+                streamer = TextIteratorStreamer(model.tokenizer, skip_prompt=True, skip_special_tokens=True)
+                Thread(
+                    target=generate_to_streamer,
+                    args=(streamer,),
+                    kwargs=dict(prompt=prompt, generation_config=generation_config),
+                ).start()
 
                 def chunk_generator():
                     prepend_space = False
@@ -279,7 +297,8 @@ async def chat_completions(request: ChatCompletionRequest):
 
             else:
 
-                outputs = model.generate_content(prompt=prompt, generation_config=generation_config)
+                with generation_lock:
+                    outputs = model.generate_content(prompt=prompt, generation_config=generation_config)
                 # Check if the response is None
                 if not outputs:
                     raise ValueError("The model response is empty or malformed.")

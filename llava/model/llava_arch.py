@@ -838,6 +838,7 @@ class LlavaMetaForCausalLM(ABC):
         prompt: Union[str, List],
         generation_config: Optional[GenerationConfig] = None,
         response_format: Optional[ResponseFormat] = None,
+        streamer: Optional[Any] = None,
     ) -> str:
         # TODO(zhijianl): Support directly taking conversation as input
         conversation = [{"from": "human", "value": prompt}]
@@ -928,6 +929,7 @@ class LlavaMetaForCausalLM(ABC):
                 media_config=media_config,
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,  # structured generation
+                streamer=streamer,
             )
         except ValueError:
             if not generation_config.do_sample:
@@ -941,6 +943,7 @@ class LlavaMetaForCausalLM(ABC):
                 media_config=media_config,
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,
+                streamer=streamer,
             )
 
         # Decode the response
@@ -1508,6 +1511,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         prompt: Union[str, List],
         generation_config: Optional[GenerationConfig] = None,
         response_format: Optional[ResponseFormat] = None,
+        streamer: Optional[Any] = None,
         # PS3 configs
         return_selection_probs: bool = False,
         smooth_selection_prob=False,
@@ -1576,6 +1580,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
                 original_image_sizes=original_image_sizes,
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,  # structured generation
+                streamer=streamer,
             )
         except ValueError:
             if not generation_config.do_sample:
@@ -1593,6 +1598,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
                 original_image_sizes=original_image_sizes,
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,
+                streamer=streamer,
             )
 
         if return_selection_probs:
