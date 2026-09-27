@@ -109,6 +109,7 @@ def main() -> None:
     parser.add_argument("--json-mode", action="store_true")
     parser.add_argument("--json-schema", type=str, default=None)
     parser.add_argument("--backend", choices=["hf", "tinychat"], default="hf")
+    parser.add_argument("--stats", action="store_true", help="Print token counts and latency metrics")
     parser.add_argument(
         "--quant-dir", type=str, default=None, help="AWQ checkpoint dir for --backend tinychat (default: runs/awq/<model>)"
     )
@@ -171,7 +172,8 @@ def main() -> None:
         prompt.append(args.text)
 
     # Generate response
-    response = model.generate_content(prompt, response_format=response_format)
+    stats = {}
+    response = model.generate_content(prompt, response_format=response_format, stats=stats)
 
     if has_video and model.config.num_time_tokens is not None and model.config.time_token_format is not None:
         # Decode time tokens
@@ -182,6 +184,14 @@ def main() -> None:
             time_token_format=model.config.time_token_format,
         )
     print(colored(response, "cyan", attrs=["bold"]))
+    if args.stats:
+        decode_speed = stats["decode_tokens_per_s"]
+        print(
+            f"prompt tokens: {stats['prompt_tokens']}, completion tokens: {stats['completion_tokens']}, "
+            f"TTFT: {stats['ttft_s']:.3f} s, "
+            f"decode: {'n/a' if decode_speed is None else f'{decode_speed:.1f} tok/s'}, "
+            f"total: {stats['total_s']:.3f} s"
+        )
 
 
 if __name__ == "__main__":

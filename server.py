@@ -8,7 +8,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Dict, List, Literal, Optional, Union, get_args
 
 import requests
@@ -160,7 +160,7 @@ context_len = None
 generation_lock = Lock()
 
 
-def generate_to_streamer(streamer: TextIteratorStreamer, **kwargs) -> None:
+def generate_to_streamer(streamer: TextIteratorStreamer, done: Event, **kwargs) -> None:
     try:
         with generation_lock:
             model.generate_content(streamer=streamer, **kwargs)
@@ -168,6 +168,27 @@ def generate_to_streamer(streamer: TextIteratorStreamer, **kwargs) -> None:
         logger.exception("Streaming generation failed")
         # Unblock the consumer so the response terminates instead of hanging.
         streamer.end()
+    finally:
+        done.set()
+
+
+def usage_fields(stats: Dict[str, Any]) -> Dict[str, Any]:
+    """OpenAI `usage` plus a non-standard `timing` section from generate_content stats."""
+    if "prompt_tokens" not in stats:
+        return {}
+    logger.info(f"Generation stats: {stats}")
+    return {
+        "usage": {
+            "prompt_tokens": stats["prompt_tokens"],
+            "completion_tokens": stats["completion_tokens"],
+            "total_tokens": stats["prompt_tokens"] + stats["completion_tokens"],
+        },
+        "timing": {key: stats[key] for key in ("ttft_s", "decode_tokens_per_s", "total_s")},
+    }
+
+
+def finish_reason_for(stats: Dict[str, Any], max_tokens: int, default: str) -> str:
+    return "length" if stats.get("completion_tokens", 0) >= max_tokens else default
 
 
 def load_image(image_url: str) -> Image:
@@ -326,15 +347,17 @@ async def chat_completions(request: ChatCompletionRequest):
             stop.append(TOOL_RESPONSE_TAG)
 
         prompt = build_conversation(request.messages, tools_prompt)
-        generate_kwargs = dict(prompt=prompt, generation_config=generation_config, stop=stop)
+        stats = {}
+        generate_kwargs = dict(prompt=prompt, generation_config=generation_config, stop=stop, stats=stats)
 
-        def make_chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
+        def make_chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None, **extra: Any) -> str:
             chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
                 "created": time.time(),
                 "model": request.model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                **extra,
             }
             return f"data: {json.dumps(chunk)}\n\n"
 
@@ -343,7 +366,8 @@ async def chat_completions(request: ChatCompletionRequest):
         with torch.inference_mode():
             if request.stream and not use_tools:
                 streamer = TextIteratorStreamer(model.tokenizer, skip_prompt=True, skip_special_tokens=True)
-                Thread(target=generate_to_streamer, args=(streamer,), kwargs=generate_kwargs).start()
+                done = Event()
+                Thread(target=generate_to_streamer, args=(streamer, done), kwargs=generate_kwargs).start()
 
                 def chunk_generator():
                     prepend_space = False
@@ -364,7 +388,10 @@ async def chat_completions(request: ChatCompletionRequest):
                     tail = stop_filter.flush()
                     if tail:
                         yield make_chunk({"content": tail})
-                    yield make_chunk({}, finish_reason="stop")
+                    # Stats are filled in once generate_content returns, right after the stream ends.
+                    done.wait(timeout=10)
+                    finish_reason = finish_reason_for(stats, generation_config.max_new_tokens, "stop")
+                    yield make_chunk({}, finish_reason=finish_reason, **usage_fields(stats))
                     yield "data: [DONE]\n\n"
 
                 return StreamingResponse(chunk_generator())
@@ -380,7 +407,7 @@ async def chat_completions(request: ChatCompletionRequest):
             text, tool_calls = parse_tool_calls(outputs, tool_names) if use_tools else (outputs, [])
             if not text and not tool_calls:
                 raise ValueError("The model response is empty or malformed.")
-            finish_reason = "tool_calls" if tool_calls else "stop"
+            finish_reason = "tool_calls" if tool_calls else finish_reason_for(stats, generation_config.max_new_tokens, "stop")
 
             if request.stream:
                 # Tool calls can only be parsed from the full output, so it is sent as a single chunk.
@@ -391,7 +418,7 @@ async def chat_completions(request: ChatCompletionRequest):
                     if tool_calls:
                         delta["tool_calls"] = [{"index": i, **call} for i, call in enumerate(tool_calls)]
                     yield make_chunk(delta)
-                    yield make_chunk({}, finish_reason=finish_reason)
+                    yield make_chunk({}, finish_reason=finish_reason, **usage_fields(stats))
                     yield "data: [DONE]\n\n"
 
                 return StreamingResponse(buffered_chunk_generator())
@@ -404,6 +431,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 "choices": [
                     {"index": 0, "message": completion_message(text, tool_calls), "finish_reason": finish_reason}
                 ],
+                **usage_fields(stats),
             }
 
     except Exception as e:

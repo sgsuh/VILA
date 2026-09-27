@@ -52,6 +52,7 @@ from llava.model.utils import get_model_config
 from llava.train.sequence_parallel import get_pg_manager
 from llava.utils import distributed
 from llava.utils.media import extract_media
+from llava.utils.generation_stats import GenerationTimer
 from llava.utils.stop_strings import truncate_at_stop
 from llava.utils.tokenizer import as_conversation, tokenize_conversation
 
@@ -835,9 +836,12 @@ class LlavaMetaForCausalLM(ABC):
         media: Optional[Dict[str, List[torch.Tensor]]] = None,
         media_config: Dict[str, Dict[str, Any]] = None,
         attention_mask: Optional[torch.LongTensor] = None,
+        stats: Optional[Dict[str, Any]] = None,
         **generation_kwargs,
     ):
         inputs_embeds, _, attention_mask = self._embed(input_ids, media, media_config, None, attention_mask)
+        if stats is not None:
+            stats["prompt_tokens"] = inputs_embeds.shape[1]
         return self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
 
     @torch.inference_mode()
@@ -848,8 +852,10 @@ class LlavaMetaForCausalLM(ABC):
         response_format: Optional[ResponseFormat] = None,
         streamer: Optional[Any] = None,
         stop: Optional[List[str]] = None,
+        stats: Optional[Dict[str, Any]] = None,
     ) -> str:
         conversation = as_conversation(prompt)
+        timer = GenerationTimer()
 
         # Convert response format to logits processor
         if response_format:
@@ -930,7 +936,8 @@ class LlavaMetaForCausalLM(ABC):
 
         # Set up the generation config
         generation_config = generation_config or self.default_generation_config
-        stopping_criteria = StoppingCriteriaList([StopStringCriteria(self.tokenizer, stop)]) if stop else None
+        stopping_criteria = StoppingCriteriaList([timer] + ([StopStringCriteria(self.tokenizer, stop)] if stop else []))
+        generation_stats = {}
 
         # Generate the response
         try:
@@ -942,10 +949,12 @@ class LlavaMetaForCausalLM(ABC):
                 logits_processor=xgr_logits_processor,  # structured generation
                 streamer=streamer,
                 stopping_criteria=stopping_criteria,
+                stats=generation_stats,
             )
         except ValueError:
             if not generation_config.do_sample:
                 raise
+            timer.reset_tokens()
             # FIXME(zhijianl): This is a temporary workaround for the sampling issue
             logging.warning("Generation failed with sampling, retrying with greedy decoding.")
             generation_config.do_sample = False
@@ -957,11 +966,14 @@ class LlavaMetaForCausalLM(ABC):
                 logits_processor=xgr_logits_processor,
                 streamer=streamer,
                 stopping_criteria=stopping_criteria,
+                stats=generation_stats,
             )
 
         # Decode the response
         response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         response = truncate_at_stop(response, stop)[0].strip()
+        if stats is not None:
+            stats.update(timer.summary(generation_stats["prompt_tokens"]))
         return response
 
     @property
@@ -1527,6 +1539,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         response_format: Optional[ResponseFormat] = None,
         streamer: Optional[Any] = None,
         stop: Optional[List[str]] = None,
+        stats: Optional[Dict[str, Any]] = None,
         # PS3 configs
         return_selection_probs: bool = False,
         smooth_selection_prob=False,
@@ -1534,6 +1547,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         original_image_sizes=None,
     ) -> str:
         conversation = as_conversation(prompt)
+        timer = GenerationTimer()
 
         # Convert response format to logits processor
         if response_format:
@@ -1583,7 +1597,8 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
 
         # Set up the generation config
         generation_config = generation_config or self.default_generation_config
-        stopping_criteria = StoppingCriteriaList([StopStringCriteria(self.tokenizer, stop)]) if stop else None
+        stopping_criteria = StoppingCriteriaList([timer] + ([StopStringCriteria(self.tokenizer, stop)] if stop else []))
+        generation_stats = {}
 
         # Generate the response
         try:
@@ -1599,10 +1614,12 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
                 logits_processor=xgr_logits_processor,  # structured generation
                 streamer=streamer,
                 stopping_criteria=stopping_criteria,
+                stats=generation_stats,
             )
         except ValueError:
             if not generation_config.do_sample:
                 raise
+            timer.reset_tokens()
             # FIXME(zhijianl): This is a temporary workaround for the sampling issue
             logging.warning("Generation failed with sampling, retrying with greedy decoding.")
             generation_config.do_sample = False
@@ -1618,6 +1635,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
                 logits_processor=xgr_logits_processor,
                 streamer=streamer,
                 stopping_criteria=stopping_criteria,
+                stats=generation_stats,
             )
 
         if return_selection_probs:
@@ -1628,6 +1646,8 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         # Decode the response
         response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
         response = truncate_at_stop(response, stop)[0].strip()
+        if stats is not None:
+            stats.update(timer.summary(generation_stats["prompt_tokens"]))
 
         if return_selection_probs:
             return response, top_down_selection_maps, top_down_selection_probs
@@ -1646,6 +1666,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         smooth_selection_prob=False,
         gt_selection_map=None,
         original_image_sizes=None,
+        stats: Optional[Dict[str, Any]] = None,
         **generation_kwargs,
     ):
         if media is not None:
@@ -1702,6 +1723,8 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         else:
             inputs_embeds, _, attention_mask = self._embed(input_ids, media, media_config, None, attention_mask)
 
+        if stats is not None:
+            stats["prompt_tokens"] = inputs_embeds.shape[1]
         outputs = self.llm.generate(inputs_embeds=inputs_embeds, attention_mask=attention_mask, **generation_kwargs)
 
         if return_selection_probs:

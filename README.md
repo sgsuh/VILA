@@ -310,6 +310,13 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+The server also supports:
+
+- `stop`: a string or list of strings that end generation (removed from the output).
+- `tools` / `tool_choice`: function calling. Tool calls are returned in `message.tool_calls` and tool results are sent back as `role: "tool"` messages. When streaming with tools, the parsed result arrives as a single chunk.
+- Metrics: responses (and the last streamed chunk) include `usage` token counts and a `timing` section with `ttft_s`, `decode_tokens_per_s` and `total_s`. `vila-infer --stats` prints the same metrics.
+- `--backend tinychat`: serve AWQ-quantized models, see [scripts/awq](scripts/awq/README.md).
+
 <sup>NOTE: This API server is intended for evaluation purposes only and has not been optimized for production use. SGLang support is coming on the way.</sup>
 
 ## Checkpoints

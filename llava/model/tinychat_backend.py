@@ -8,11 +8,13 @@ TinyChat is imported lazily: importing it patches torch weight-init functions gl
 """
 
 import os
-from typing import Any, List, Optional, Union
+import time
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from transformers import AutoConfig, GenerationConfig
 
+from llava.utils.generation_stats import summarize_generation
 from llava.utils.logging import logger
 from llava.utils.stop_strings import truncate_at_stop
 from llava.utils.tokenizer import as_conversation
@@ -22,6 +24,24 @@ SMOOTH_SCALE_FILENAME = "smooth-scale.pt"
 # SmoothQuant migration strength used by tinychat/nvila_demo.py.
 SMOOTH_ALPHA = 0.3
 ROLES = {"system": "system", "human": "user", "gpt": "assistant"}
+
+
+class _StepRecorder:
+    """Proxy for the TinyChat model that records the input length and end time of each forward step."""
+
+    def __init__(self, model) -> None:
+        self._model = model
+        self.step_lengths = []
+        self.step_times = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model, name)
+
+    def stream_gen(self, *args, **kwargs):
+        out, length = self._model.stream_gen(*args, **kwargs)
+        self.step_lengths.append(length)
+        self.step_times.append(time.perf_counter())
+        return out, length
 
 
 def resolve_model_path(model_path: str) -> str:
@@ -120,11 +140,14 @@ class TinyChatNVILA:
         response_format: Optional[Any] = None,
         streamer: Optional[Any] = None,
         stop: Optional[List[str]] = None,
+        stats: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Generate a response; if given, `streamer` (a TextIteratorStreamer) receives text deltas.
 
         `prompt` is a single-turn prompt or a conversation (see `llava.utils.tokenizer.as_conversation`).
+        If given, `stats` is filled with token counts and latency metrics.
         """
+        start = time.perf_counter()
         if response_format is not None:
             raise NotImplementedError("response_format is not supported by the TinyChat backend")
 
@@ -140,8 +163,10 @@ class TinyChatNVILA:
             tokenize=False,
         )
 
+        # Each step generates one token; the first step's input is the whole prompt (media embeddings included).
+        recorder = _StepRecorder(self.model)
         outputs = NVILAStreamGenerator(
-            self.model,
+            recorder,
             self._to_gen_params(generation_config or self.default_generation_config),
             text_prompt,
             media or None,
@@ -169,4 +194,15 @@ class TinyChatNVILA:
         finally:
             if streamer is not None:
                 streamer.on_finalized_text(text[len(streamed) :] if text.startswith(streamed) else "", stream_end=True)
+        if stats is not None and recorder.step_lengths:
+            stats.update(
+                summarize_generation(
+                    recorder.step_lengths[0],
+                    len(recorder.step_lengths),
+                    start,
+                    recorder.step_times[0],
+                    recorder.step_times[-1],
+                    time.perf_counter(),
+                )
+            )
         return text.strip()
