@@ -3,9 +3,13 @@
 #   docker compose run --rm vila                  # interactive shell
 #   docker compose run --rm vila vila-infer ...   # one-off command
 #   docker compose up vila-server                 # OpenAI-compatible API on :8000
+#
+# Containers run as HOST_UID:HOST_GID (default 1000:1000) so files written to the
+# bind mounts stay owned by the host user. Use `--user root` for ad-hoc installs.
 
 x-vila-common: &vila-common
   image: vila-dev:latest
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
   gpus: all
   ipc: host
   ulimits:
@@ -13,8 +17,9 @@ x-vila-common: &vila-common
     stack: 67108864
   volumes:
     - .:/workspace/VILA
-    - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+    - ${HF_CACHE_DIR:-~/.cache/huggingface}:/cache/huggingface
   environment:
+    HF_HOME: /cache/huggingface
     VILA_MODEL_PATH: ${VILA_MODEL_PATH:-Efficient-Large-Model/NVILA-Lite-2B}
     VILA_CONV_MODE: ${VILA_CONV_MODE:-auto}
     HF_TOKEN: ${HF_TOKEN:-}

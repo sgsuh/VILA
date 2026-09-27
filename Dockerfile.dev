@@ -36,4 +36,9 @@ COPY llava llava
 RUN --mount=type=cache,target=/root/.cache/pip \
     bash environment_setup.sh
 
+# Writable HOME for non-root users (triton/torch caches); the container runs
+# as the host UID via docker-compose.yml.
+RUN mkdir -p /home/vila && chmod 1777 /home/vila
+ENV HOME=/home/vila
+
 CMD ["bash"]
