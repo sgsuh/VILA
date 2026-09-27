@@ -36,6 +36,22 @@ COPY llava llava
 RUN --mount=type=cache,target=/root/.cache/pip \
     bash environment_setup.sh
 
+# AWQ quantization + TinyChat inference (mit-han-lab/llm-awq), pinned for reproducibility.
+# TORCH_CUDA_ARCH_LIST selects the GPU archs for the CUDA kernels
+# (8.9 = RTX 40 series, 8.6 = RTX 30 series, 8.0 = A100, 8.7 = Jetson Orin).
+ARG LLM_AWQ_COMMIT=d6e797a
+ARG TORCH_CUDA_ARCH_LIST=8.9
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone https://github.com/mit-han-lab/llm-awq /opt/llm-awq \
+    && git -C /opt/llm-awq checkout ${LLM_AWQ_COMMIT} \
+    && pip install -e /opt/llm-awq \
+    && cd /opt/llm-awq/awq/kernels \
+    && TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST}" MAX_JOBS=2 pip install --no-build-isolation .
+
+# Installing llm-awq re-resolves torch's triton==2.3.0; restore the version environment_setup.sh pins.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install triton==3.1.0
+
 # Writable HOME for non-root users (triton/torch caches); the container runs
 # as the host UID via docker-compose.yml.
 RUN mkdir -p /home/vila && chmod 1777 /home/vila
