@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from io import BytesIO
 from threading import Lock, Thread
-from typing import List, Literal, Optional, Union, get_args
+from typing import Any, Dict, List, Literal, Optional, Union, get_args
 
 import requests
 import torch
@@ -30,6 +30,14 @@ from llava.conversation import SeparatorStyle, conv_templates
 from llava.mm_utils import KeywordsStoppingCriteria, get_model_name_from_path, tokenizer_image_token
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
+from llava.utils.stop_strings import StopStringFilter, truncate_at_stop
+from llava.utils.tool_calls import (
+    TOOL_RESPONSE_TAG,
+    build_tools_system_prompt,
+    format_tool_call,
+    format_tool_response,
+    parse_tool_calls,
+)
 
 
 class TextContent(BaseModel):
@@ -77,9 +85,42 @@ def load_video(video_url: str) -> str:
 
     return temp_fpath
 
+class ToolCallFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal["function"] = "function"
+    function: ToolCallFunction
+
+
 class ChatMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: Union[str, List[Union[TextContent, ImageContent, VideoContent]]]
+    role: Literal["system", "user", "assistant", "tool"]
+    content: Optional[Union[str, List[Union[TextContent, ImageContent, VideoContent]]]] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+
+
+class FunctionDefinition(BaseModel):
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+
+
+class Tool(BaseModel):
+    type: Literal["function"] = "function"
+    function: FunctionDefinition
+
+
+class NamedFunction(BaseModel):
+    name: str
+
+
+class NamedToolChoice(BaseModel):
+    type: Literal["function"] = "function"
+    function: NamedFunction
 
 
 class ChatCompletionRequest(BaseModel):
@@ -104,6 +145,9 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     use_cache: Optional[bool] = True
     num_beams: Optional[int] = 1
+    stop: Optional[Union[str, List[str]]] = None
+    tools: Optional[List[Tool]] = None
+    tool_choice: Optional[Union[Literal["none", "auto", "required"], NamedToolChoice]] = None
 
 
 model = None
@@ -159,12 +203,67 @@ def get_literal_values(cls, field_name: str):
 VILA_MODELS = get_literal_values(ChatCompletionRequest, "model")
 
 
-def normalize_image_tags(qs: str) -> str:
-    if MEDIA_TOKENS["image"] not in qs:
-        logger.warning("No image was found in input messages.")
-    elif MEDIA_TOKENS["video"] not in qs:
-        logger.warning("No video was found in input messages.")
-    return qs
+def content_parts(content) -> List[Any]:
+    """Convert OpenAI message content into generate_content prompt parts (text, images, videos)."""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [content]
+    parts = []
+    for item in content:
+        if item.type == "text":
+            parts.append(item.text)
+        elif item.type == "image_url":
+            parts.append(load_image(item.image_url.url))
+        elif item.type == "video_url":
+            video = load_video(item.video_url.url)
+            logger.info(f"loading {item.frames} frames from {video}")
+            model.config.num_video_frames = item.frames
+            model.config.fps = item.fps
+            parts.append(Video(video))
+        else:
+            raise NotImplementedError(f"Unsupported content type: {item.type}")
+    return parts
+
+
+def content_text(content) -> str:
+    return "".join(part for part in content_parts(content) if isinstance(part, str))
+
+
+def build_conversation(messages: List[ChatMessage], tools_prompt: Optional[str]) -> List[Dict[str, Any]]:
+    """Convert OpenAI messages into a generate_content conversation.
+
+    Tool calls and results are rendered as <tool_call>/<tool_response> text; tool results go in
+    user turns, and consecutive turns from the same sender are merged.
+    """
+    system_texts = [content_text(m.content) for m in messages if m.role == "system"]
+    if tools_prompt is not None:
+        system_texts = [*(system_texts or ["You are a helpful assistant."]), tools_prompt]
+
+    conversation = [{"from": "system", "value": "\n\n".join(system_texts)}] if system_texts else []
+    for message in messages:
+        if message.role == "system":
+            continue
+        if message.role == "tool":
+            sender, parts = "human", [format_tool_response(content_text(message.content))]
+        elif message.role == "assistant":
+            calls = [format_tool_call(c.function.name, c.function.arguments) for c in message.tool_calls or []]
+            sender, parts = "gpt", ["\n".join([content_text(message.content), *calls]).strip()]
+        else:
+            sender, parts = "human", content_parts(message.content)
+
+        if conversation and conversation[-1]["from"] == sender:
+            conversation[-1]["value"] += ["\n", *parts]
+        else:
+            conversation.append({"from": sender, "value": parts})
+    return conversation
+
+
+def completion_message(text: str, tool_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    message = {"role": "assistant", "content": [{"type": "text", "text": text}] if text else None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return message
 
 
 @asynccontextmanager
@@ -210,74 +309,45 @@ async def chat_completions(request: ChatCompletionRequest):
         generation_config.num_beams = request.num_beams
         generation_config.use_cache = request.use_cache
 
-        messages = request.messages
-        conv_mode = app.args.conv_mode
-
-        conv = conv_templates[conv_mode].copy()
-        user_role = conv.roles[0]
-        assistant_role = conv.roles[1]
-        image = None
-        video = None
-        for message in messages:
-            prompt = ""
-
-            if message.role == "user":
-                if isinstance(message.content, str):
-                    prompt+= message.content
-                elif isinstance(message.content, list):
-                    for content in message.content:
-                        if content.type == "text":
-                            prompt += content.text
-                        elif content.type == "image_url":
-                            image = load_image(content.image_url.url)
-                            prompt += MEDIA_TOKENS["image"]
-                        elif content.type == "video_url":
-                            video = load_video(content.video_url.url)
-                            logger.info(f"loading {content.frames} frames from {video}")
-                            model.config.num_video_frames = content.frames
-                            model.config.fps = content.fps
-                            video = Video(video)
-                            prompt += MEDIA_TOKENS["video"]
-                        else:
-                            raise NotImplementedError(f"Unsupported content type: {content.type}")
-
-                normalized_prompt = normalize_image_tags(prompt)
-                conv.append_message(user_role, normalized_prompt)
-            if message.role == "assistant":
-                prompt = message.content
-                conv.append_message(assistant_role, prompt)
-
-        # add a last "assistant" message to complete the prompt
-        if conv.sep_style == SeparatorStyle.LLAMA_3:
-            conv.append_message(assistant_role, "")
-
-        # SeparatorStyle.AUTO has no manual prompt format; generate_content applies the tokenizer chat template.
-        if conv.sep_style != SeparatorStyle.AUTO:
-            prompt_text = conv.get_prompt()
-            logger.info(f"Prompt input: {prompt_text}")
-
+        conv = conv_templates[app.args.conv_mode].copy()
         stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
 
-        if image is not None:
-            prompt = [image, normalized_prompt]
-        elif video is not None:
-            prompt = [video, normalized_prompt]
-        else:
-            prompt = normalized_prompt
+        stop = [request.stop] if isinstance(request.stop, str) else list(request.stop or [])
+        tool_names = [tool.function.name for tool in request.tools or []]
+        use_tools = bool(tool_names) and request.tool_choice != "none"
+        tools_prompt = None
+        if use_tools:
+            if isinstance(request.tool_choice, NamedToolChoice):
+                required = request.tool_choice.function.name
+            else:
+                required = request.tool_choice == "required"
+            tools_prompt = build_tools_system_prompt([tool.dict(exclude_none=True) for tool in request.tools], required)
+            # Keep the model from hallucinating the tool result after its call.
+            stop.append(TOOL_RESPONSE_TAG)
+
+        prompt = build_conversation(request.messages, tools_prompt)
+        generate_kwargs = dict(prompt=prompt, generation_config=generation_config, stop=stop)
+
+        def make_chunk(delta: Dict[str, Any], finish_reason: Optional[str] = None) -> str:
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": time.time(),
+                "model": request.model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            }
+            return f"data: {json.dumps(chunk)}\n\n"
+
+        completion_id = uuid.uuid4().hex
 
         with torch.inference_mode():
-            if request.stream:
+            if request.stream and not use_tools:
                 streamer = TextIteratorStreamer(model.tokenizer, skip_prompt=True, skip_special_tokens=True)
-                Thread(
-                    target=generate_to_streamer,
-                    args=(streamer,),
-                    kwargs=dict(prompt=prompt, generation_config=generation_config),
-                ).start()
+                Thread(target=generate_to_streamer, args=(streamer,), kwargs=generate_kwargs).start()
 
                 def chunk_generator():
                     prepend_space = False
-                    should_stop = False
-                    chunk_id = 0
+                    stop_filter = StopStringFilter(stop)
                     for new_text in streamer:
                         if new_text == " ":
                             prepend_space = True
@@ -285,44 +355,56 @@ async def chat_completions(request: ChatCompletionRequest):
                         if new_text.endswith(stop_str):
                             new_text = new_text[: -len(stop_str)].strip()
                             prepend_space = False
-                            should_stop = True
                         elif prepend_space:
                             new_text = " " + new_text
                             prepend_space = False
+                        new_text = stop_filter.feed(new_text)
                         if len(new_text):
-                            chunk = {
-                                "id": str(chunk_id),
-                                "object": "chat.completion.chunk",
-                                "created": time.time(),
-                                "model": request.model,
-                                "choices": [{"delta": {"content": new_text}}],
-                            }
-                            yield f"data: {json.dumps(chunk)}\n\n"
+                            yield make_chunk({"content": new_text})
+                    tail = stop_filter.flush()
+                    if tail:
+                        yield make_chunk({"content": tail})
+                    yield make_chunk({}, finish_reason="stop")
                     yield "data: [DONE]\n\n"
 
                 return StreamingResponse(chunk_generator())
 
-            else:
+            with generation_lock:
+                outputs = model.generate_content(**generate_kwargs)
+            outputs = truncate_at_stop(outputs, stop)[0]
+            if outputs.endswith(stop_str):
+                outputs = outputs[: -len(stop_str)]
+            outputs = outputs.strip()
+            print("\nAssistant: ", outputs)
 
-                with generation_lock:
-                    outputs = model.generate_content(prompt=prompt, generation_config=generation_config)
-                # Check if the response is None
-                if not outputs:
-                    raise ValueError("The model response is empty or malformed.")
+            text, tool_calls = parse_tool_calls(outputs, tool_names) if use_tools else (outputs, [])
+            if not text and not tool_calls:
+                raise ValueError("The model response is empty or malformed.")
+            finish_reason = "tool_calls" if tool_calls else "stop"
 
-                if outputs.endswith(stop_str):
-                    outputs = outputs[: -len(stop_str)]
-                outputs = outputs.strip()
-                print("\nAssistant: ", outputs)
+            if request.stream:
+                # Tool calls can only be parsed from the full output, so it is sent as a single chunk.
+                def buffered_chunk_generator():
+                    delta = {"role": "assistant"}
+                    if text:
+                        delta["content"] = text
+                    if tool_calls:
+                        delta["tool_calls"] = [{"index": i, **call} for i, call in enumerate(tool_calls)]
+                    yield make_chunk(delta)
+                    yield make_chunk({}, finish_reason=finish_reason)
+                    yield "data: [DONE]\n\n"
 
-                resp_content = [TextContent(type="text", text=outputs)]
-                return {
-                    "id": uuid.uuid4().hex,
-                    "object": "chat.completion",
-                    "created": time.time(),
-                    "model": request.model,
-                    "choices": [{"message": ChatMessage(role="assistant", content=resp_content)}],
-                }
+                return StreamingResponse(buffered_chunk_generator())
+
+            return {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": time.time(),
+                "model": request.model,
+                "choices": [
+                    {"index": 0, "message": completion_message(text, tool_calls), "finish_reason": finish_reason}
+                ],
+            }
 
     except Exception as e:
         return JSONResponse(

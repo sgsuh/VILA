@@ -14,11 +14,14 @@ import torch
 from transformers import AutoConfig, GenerationConfig
 
 from llava.utils.logging import logger
+from llava.utils.stop_strings import truncate_at_stop
+from llava.utils.tokenizer import as_conversation
 
 QUANT_LLM_FILENAME = "llm-w4-g128-v2.pt"
 SMOOTH_SCALE_FILENAME = "smooth-scale.pt"
 # SmoothQuant migration strength used by tinychat/nvila_demo.py.
 SMOOTH_ALPHA = 0.3
+ROLES = {"system": "system", "human": "user", "gpt": "assistant"}
 
 
 def resolve_model_path(model_path: str) -> str:
@@ -116,24 +119,31 @@ class TinyChatNVILA:
         generation_config: Optional[GenerationConfig] = None,
         response_format: Optional[Any] = None,
         streamer: Optional[Any] = None,
+        stop: Optional[List[str]] = None,
     ) -> str:
-        """Generate a response; if given, `streamer` (a TextIteratorStreamer) receives text deltas."""
+        """Generate a response; if given, `streamer` (a TextIteratorStreamer) receives text deltas.
+
+        `prompt` is a single-turn prompt or a conversation (see `llava.utils.tokenizer.as_conversation`).
+        """
         if response_format is not None:
             raise NotImplementedError("response_format is not supported by the TinyChat backend")
 
         from tinychat.stream_generators.NVILA_stream_gen import NVILAStreamGenerator
-        from tinychat.utils.prompt_templates import NVILAPrompter, get_stop_token_ids
+        from tinychat.utils.prompt_templates import get_stop_token_ids
 
-        # prepare_media rewrites the conversation text with one media token per image tile / video frame.
-        conversation = [{"from": "human", "value": prompt}]
+        # prepare_media replaces media parts with media tokens in the conversation text.
+        conversation = as_conversation(prompt)
         media, media_config = self.model.prepare_media(conversation)
-        prompter = NVILAPrompter()
-        prompter.insert_prompt(conversation[0]["value"])
+        text_prompt = self.tokenizer.apply_chat_template(
+            [{"role": ROLES[m["from"]], "content": m["value"].strip()} for m in conversation],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
 
         outputs = NVILAStreamGenerator(
             self.model,
             self._to_gen_params(generation_config or self.default_generation_config),
-            prompter.model_input,
+            text_prompt,
             media or None,
             media_config if media else None,
             start_pos=0,
@@ -145,11 +155,14 @@ class TinyChatNVILA:
         text = streamed = ""
         try:
             for output in outputs:
-                text = output["text"]
+                text, stopped = truncate_at_stop(output["text"], stop)
                 # Hold back incomplete multi-byte characters until they decode fully.
-                if streamer is not None and text.startswith(streamed) and not text.endswith("�"):
+                if streamer is not None and text.startswith(streamed) and not text.endswith("\ufffd"):
                     streamer.on_finalized_text(text[len(streamed) :])
                     streamed = text
+                if stopped:
+                    outputs.close()
+                    break
         except SystemExit as e:
             # NVILAStreamGenerator calls exit() when sampling hits Inf/NaN probabilities.
             raise RuntimeError("TinyChat generation produced invalid probabilities") from e

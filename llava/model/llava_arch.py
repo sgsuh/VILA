@@ -30,7 +30,14 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 from hydra.utils import instantiate
-from transformers import AutoConfig, GenerationConfig, LogitsProcessor, PreTrainedModel
+from transformers import (
+    AutoConfig,
+    GenerationConfig,
+    LogitsProcessor,
+    PreTrainedModel,
+    StoppingCriteriaList,
+    StopStringCriteria,
+)
 from transformers.modeling_utils import ContextManagers, no_init_weights
 from llava.constants import MEDIA_TOKENS
 
@@ -45,7 +52,8 @@ from llava.model.utils import get_model_config
 from llava.train.sequence_parallel import get_pg_manager
 from llava.utils import distributed
 from llava.utils.media import extract_media
-from llava.utils.tokenizer import tokenize_conversation
+from llava.utils.stop_strings import truncate_at_stop
+from llava.utils.tokenizer import as_conversation, tokenize_conversation
 
 
 class LlavaMetaModel(ABC):
@@ -839,9 +847,9 @@ class LlavaMetaForCausalLM(ABC):
         generation_config: Optional[GenerationConfig] = None,
         response_format: Optional[ResponseFormat] = None,
         streamer: Optional[Any] = None,
+        stop: Optional[List[str]] = None,
     ) -> str:
-        # TODO(zhijianl): Support directly taking conversation as input
-        conversation = [{"from": "human", "value": prompt}]
+        conversation = as_conversation(prompt)
 
         # Convert response format to logits processor
         if response_format:
@@ -863,9 +871,11 @@ class LlavaMetaForCausalLM(ABC):
                     self.config.image_processor = self.vision_tower.image_processor
                     if self.config.image_aspect_ratio == "dynamic":
                         images = process_image(media["image"][0], self.config, None, enable_dynamic_res=True).half()
-                        conversation[0]["value"] = conversation[0]["value"].replace(
-                            DEFAULT_IMAGE_TOKEN, f"{DEFAULT_IMAGE_TOKEN}\n" * images.shape[0]
-                        )
+                        # The single image may sit in any turn of the conversation.
+                        for message in conversation:
+                            message["value"] = message["value"].replace(
+                                DEFAULT_IMAGE_TOKEN, f"{DEFAULT_IMAGE_TOKEN}\n" * images.shape[0]
+                            )
                     else:
                         if type(self.config.s2_scales) is str:
                             self.config.s2_scales = list(map(int, self.config.s2_scales.split(",")))
@@ -920,6 +930,7 @@ class LlavaMetaForCausalLM(ABC):
 
         # Set up the generation config
         generation_config = generation_config or self.default_generation_config
+        stopping_criteria = StoppingCriteriaList([StopStringCriteria(self.tokenizer, stop)]) if stop else None
 
         # Generate the response
         try:
@@ -930,6 +941,7 @@ class LlavaMetaForCausalLM(ABC):
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,  # structured generation
                 streamer=streamer,
+                stopping_criteria=stopping_criteria,
             )
         except ValueError:
             if not generation_config.do_sample:
@@ -944,10 +956,12 @@ class LlavaMetaForCausalLM(ABC):
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,
                 streamer=streamer,
+                stopping_criteria=stopping_criteria,
             )
 
         # Decode the response
-        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        response = truncate_at_stop(response, stop)[0].strip()
         return response
 
     @property
@@ -1512,14 +1526,14 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
         generation_config: Optional[GenerationConfig] = None,
         response_format: Optional[ResponseFormat] = None,
         streamer: Optional[Any] = None,
+        stop: Optional[List[str]] = None,
         # PS3 configs
         return_selection_probs: bool = False,
         smooth_selection_prob=False,
         gt_selection_map=None,
         original_image_sizes=None,
     ) -> str:
-        # TODO(zhijianl): Support directly taking conversation as input
-        conversation = [{"from": "human", "value": prompt}]
+        conversation = as_conversation(prompt)
 
         # Convert response format to logits processor
         if response_format:
@@ -1540,9 +1554,11 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
                     self.config.image_processor = self.vision_tower.image_processor
                     if self.config.image_aspect_ratio == "dynamic":
                         images = process_image(media["image"][0], self.config, None, enable_dynamic_res=True).half()
-                        conversation[0]["value"] = conversation[0]["value"].replace(
-                            DEFAULT_IMAGE_TOKEN, f"{DEFAULT_IMAGE_TOKEN}\n" * images.shape[0]
-                        )
+                        # The single image may sit in any turn of the conversation.
+                        for message in conversation:
+                            message["value"] = message["value"].replace(
+                                DEFAULT_IMAGE_TOKEN, f"{DEFAULT_IMAGE_TOKEN}\n" * images.shape[0]
+                            )
                     else:
                         if type(self.config.s2_scales) is str:
                             self.config.s2_scales = list(map(int, self.config.s2_scales.split(",")))
@@ -1567,6 +1583,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
 
         # Set up the generation config
         generation_config = generation_config or self.default_generation_config
+        stopping_criteria = StoppingCriteriaList([StopStringCriteria(self.tokenizer, stop)]) if stop else None
 
         # Generate the response
         try:
@@ -1581,6 +1598,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,  # structured generation
                 streamer=streamer,
+                stopping_criteria=stopping_criteria,
             )
         except ValueError:
             if not generation_config.do_sample:
@@ -1599,6 +1617,7 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
                 generation_config=generation_config,
                 logits_processor=xgr_logits_processor,
                 streamer=streamer,
+                stopping_criteria=stopping_criteria,
             )
 
         if return_selection_probs:
@@ -1607,7 +1626,8 @@ class LlavaTopDownMetaForCausalLM(LlavaMetaForCausalLM):
             output_ids = outputs
 
         # Decode the response
-        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        response = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        response = truncate_at_stop(response, stop)[0].strip()
 
         if return_selection_probs:
             return response, top_down_selection_maps, top_down_selection_probs

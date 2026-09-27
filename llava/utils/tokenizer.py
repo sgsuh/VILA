@@ -14,7 +14,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 import torch
 import transformers
@@ -69,6 +69,14 @@ def tokenize_conversation_legacy(
     return tokenizer_image_token(conv.get_prompt(), tokenizer, return_tensors="pt")
 
 
+def as_conversation(prompt: Union[str, List[Any]]) -> List[Dict[str, Any]]:
+    """Wrap a single-turn prompt as a conversation, or copy a conversation given as
+    [{"from": "system" | "human" | "gpt", "value": ...}, ...]."""
+    if isinstance(prompt, list) and prompt and all(isinstance(m, dict) and "from" in m for m in prompt):
+        return [dict(m) for m in prompt]
+    return [{"from": "human", "value": prompt}]
+
+
 def tokenize_conversation(
     messages: Sequence[Dict[str, str]],
     tokenizer: transformers.PreTrainedTokenizer,
@@ -96,6 +104,8 @@ def tokenize_conversation(
             message["role"] = "user"
         elif m["from"] == "gpt":
             message["role"] = "assistant"
+        elif m["from"] == "system":
+            message["role"] = "system"
         else:
             raise ValueError(f"Unexpected sender '{m['from']}' in conversation entry.")
 
